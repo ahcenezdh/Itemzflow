@@ -22,7 +22,7 @@
 *.json
 *.sqlite
 *.ipch
-*.db
+#*.db
 *.db-wal
 *.db-shm
 *.opendb
