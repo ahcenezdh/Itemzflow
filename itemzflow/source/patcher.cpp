@@ -6,178 +6,169 @@
 #include <fstream>
 #include <locale>
 #include <codecvt>
+#include <filesystem>
 #include "game_saves.h"
 #include "patcher.h"
 #include "net.h"
 
-unsigned char false_data[2] = { 0x30, 0xa }; // "0\n"
-unsigned char true__data[2] = { 0x31, 0xa }; // "1\n"
-std::string patch_file;
-extern u32 patch_count;
+namespace fs = std::filesystem;
 
-u64 djb2(const char *str) {
-    u64 hash = 5381;
-    u32 c;
-    while ((c = *str++))
-        hash = hash * 33 ^ c;
-    return hash;
-}
+class PatchManager {
+private:
+    static constexpr unsigned char FALSE_DATA[2] = { 0x30, 0xa }; // "0\n"
+    static constexpr unsigned char TRUE_DATA[2] = { 0x31, 0xa }; // "1\n"
+    std::string patch_file;
+    std::string patch_path_base = "/data/GoldHEN";
 
+    static u64 djb2(const std::string& str) {
+        u64 hash = 5381;
+        for (char c : str) {
+            hash = hash * 33 ^ c;
+        }
+        return hash;
+    }
 
-u64 patch_hash_calc(std::string title, std::string name, std::string app_ver, std::string title_id, std::string name_elf)
-{
-    std::string pre_hash = title + name + app_ver + title_id + name_elf;
-    u64 hash_data = djb2(pre_hash.c_str());
-    log_debug("hash_input: %s", pre_hash.c_str());
-    log_debug("hash_data: 0x%016lx", hash_data);
-    return hash_data;
-}
+    bool writeToFile(const std::string& filename, const std::string& data) {
+        std::ofstream file(filename);
+        if (!file) return false;
+        file << data;
+        return true;
+    }
 
-void write_enable(std::string cfg_file, std::string patch_name) {
-    std::ifstream exists;
-    exists.open(cfg_file);
-    if (exists)
-    {
+    std::string readFromFile(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) return "";
         std::stringstream buffer;
-        buffer << exists.rdbuf();
-        char data[2];
-        buffer.get(data, 2);
-        std::ofstream output_hash_file_stream;
-        std::string state_data = "";
-        if (data[0] == 0x30)
-        {
-            output_hash_file_stream.open(cfg_file);
-            state_data = "1\n";
-            output_hash_file_stream << state_data;
-            output_hash_file_stream.close();
-            // msgok(MSG_DIALOG::NORMAL, "TRUE");
-            log_debug("setting %s true", cfg_file.c_str());
-            std::string patch_state = fmt::format("{} {}", getLangSTR(LANG_STR::PATCH_SET1), patch_name);
-            ani_notify(NOTIFI::GAME, patch_state, "");
-        }
-        if (data[0] == 0x31)
-        {
-            output_hash_file_stream.open(cfg_file);
-            state_data = "0\n";
-            output_hash_file_stream << state_data;
-            output_hash_file_stream.close();
-            // msgok(MSG_DIALOG::NORMAL, "FALSE");
-            log_debug("setting %s false", cfg_file.c_str());
-            std::string patch_state = fmt::format("{} {}", getLangSTR(LANG_STR::PATCH_SET0), patch_name);
+        buffer << file.rdbuf();
+        return buffer.str();
+    }
+
+public:
+    u64 patch_hash_calc(const std::string& title, const std::string& name, const std::string& app_ver, 
+                        const std::string& title_id, const std::string& name_elf) {
+        std::string pre_hash = title + name + app_ver + title_id + name_elf;
+        u64 hash_data = djb2(pre_hash);
+        log_debug("hash_input: %s", pre_hash.c_str());
+        log_debug("hash_data: 0x%016lx", hash_data);
+        return hash_data;
+    }
+
+    void write_enable(const std::string& cfg_file, const std::string& patch_name) {
+        std::string content = readFromFile(cfg_file);
+        if (content.empty()) return;
+
+        bool new_state = (content[0] == '0');
+        std::string new_content = new_state ? "1\n" : "0\n";
+        
+        if (writeToFile(cfg_file, new_content)) {
+            log_debug("Setting %s %s", cfg_file.c_str(), new_state ? "true" : "false");
+            std::string patch_state = fmt::format("{} {}", 
+                new_state ? getLangSTR(LANG_STR::PATCH_SET1) : getLangSTR(LANG_STR::PATCH_SET0),
+                patch_name);
             ani_notify(NOTIFI::GAME, patch_state, "");
         }
     }
-    return;
-}
 
-bool get_patch_path(std::string path){
-    std::ifstream exists;
-    bool ret = true;
-    patch_file = fmt::format("{}/patches/xml/{}.xml", patch_path_base, path);
-    log_info("got patch path: %s", patch_file.c_str());
-    exists.open(patch_file);
-    if (!exists) {
-        log_info("file: %s does not exist", patch_file.c_str());
-        ret = false;
+    bool get_patch_path(const std::string& path) {
+        patch_file = fmt::format("{}/patches/xml/{}.xml", patch_path_base, path);
+        log_info("Got patch path: %s", patch_file.c_str());
+        return fs::exists(patch_file);
     }
-    log_info("ret: %i", ret);
-    return ret;
+
+    void get_metadata1(struct _trainer_struct *tmp,
+                       const std::string& patch_app_ver,
+                       const std::string& patch_app_elf,
+                       const std::string& patch_title,
+                       const std::string& patch_ver,
+                       const std::string& patch_name,
+                       const std::string& patch_author,
+                       const std::string& patch_note) 
+    {
+        u64 hash_ret = patch_hash_calc(patch_title, patch_name, patch_app_ver, patch_file, patch_app_elf);
+        std::string hash_id = fmt::format("{:#016x}", hash_ret);
+        std::string hash_file = fmt::format("{}/patches/settings/{}.txt", patch_path_base, hash_id);
+
+        std::string content = readFromFile(hash_file);
+        if (content.empty()) {
+            log_warn("File %s not found, initializing false", hash_file.c_str());
+            writeToFile(hash_file, "0\n");
+            content = "0\n";
+        }
+
+        bool cfg_state = (content[0] == '1');
+
+        tmp->patcher_app_ver.push_back(patch_app_ver);
+        tmp->patcher_app_elf.push_back(patch_app_elf);
+        tmp->patcher_title.push_back(patch_title);
+        tmp->patcher_patch_ver.push_back(patch_ver);
+        tmp->patcher_name.push_back(patch_name);
+        tmp->patcher_author.push_back(patch_author);
+        tmp->patcher_note.push_back(patch_note);
+        tmp->patcher_enablement.push_back(cfg_state);
+    }
+
+    void dl_patches() {
+        std::string patch_zip = "patch1.zip";
+        std::string patch_url = "https://github.com/GoldHEN/GoldHEN_Patch_Repository/raw/gh-pages/" + patch_zip;
+        std::string patch_path = patch_path_base + "/" + patch_zip;
+        std::string patch_build_path = patch_path_base + "/patches/misc/patch_ver.txt";
+        
+        loadmsg(getLangSTR(LANG_STR::PATCH_DL_QUESTION_YES));
+        
+        int ret = dl_from_url(patch_url.c_str(), patch_path.c_str());
+        if (ret != 0) {
+            log_error("dl_from_url for %s failed with %i", patch_url.c_str(), ret);
+            msgok(MSG_DIALOG::NORMAL, fmt::format("Download failed with error code: {}", ret));
+            return;
+        }
+
+        if (!extract_zip(patch_path.c_str(), patch_path_base.c_str())) {
+            msgok(MSG_DIALOG::NORMAL, fmt::format("Failed to extract patch zip to {}", patch_path_base));
+            return;
+        }
+
+        std::string patch_ver = readFromFile(patch_build_path);
+        std::string patch_dl_msg = fmt::format("{}\n{}", getLangSTR(LANG_STR::PATCH_DL_COMPLETE), patch_ver);
+        
+        sceMsgDialogTerminate();
+        msgok(MSG_DIALOG::NORMAL, patch_dl_msg);
+    }
+};
+
+// For backwards compability 
+PatchManager g_patchManager;
+
+
+u64 patch_hash_calc(const std::string& title, const std::string& name, const std::string& app_ver, 
+                    const std::string& title_id, const std::string& name_elf) {
+    return g_patchManager.patch_hash_calc(title, name, app_ver, title_id, name_elf);
 }
 
-std::string get_patch_data(std::string path){
-    return nullptr;
+void write_enable(const std::string& cfg_file, const std::string& patch_name) {
+    g_patchManager.write_enable(cfg_file, patch_name);
 }
 
-bool get_metadata0(s32& pid, u64 ex_start) {
-    return false;
+bool get_patch_path(const std::string& path) {
+    return g_patchManager.get_patch_path(path);
 }
 
 void get_metadata1(struct _trainer_struct *tmp,
-                   std::string patch_app_ver,
-                   std::string patch_app_elf,
-                   std::string patch_title,
-                   std::string patch_ver,
-                   std::string patch_name,
-                   std::string patch_author,
-                   std::string patch_note) 
+                   const std::string& patch_app_ver,
+                   const std::string& patch_app_elf,
+                   const std::string& patch_title,
+                   const std::string& patch_ver,
+                   const std::string& patch_name,
+                   const std::string& patch_author,
+                   const std::string& patch_note) 
 {
-    // first time setup
-    bool cfg_state = false;
-    u64 hash_ret = patch_hash_calc(patch_title, patch_name, patch_app_ver, patch_file, patch_app_elf);
-    std::string hash_id = fmt::format("{:#016x}", hash_ret);
-    std::string hash_file = fmt::format("/data/GoldHEN/patches/settings/{0}.txt", hash_id);
-    std::ifstream hash_file_stream;
-    hash_file_stream.open(hash_file);
-
-    if (!hash_file_stream)
-    {
-        log_warn("file %s not found, initializing false\n", hash_file.c_str());
-        std::ofstream output_hash_file_stream;
-        output_hash_file_stream.open(hash_file);
-        std::string off_data = "0\n";
-        output_hash_file_stream << off_data;
-        output_hash_file_stream.close();
-        // reopen the file with new data
-        hash_file_stream.close();
-        hash_file_stream.open(hash_file);
-    }
-
-    std::stringstream buffer;
-    buffer << hash_file_stream.rdbuf();
-
-    if(hash_file_stream)
-    {
-        char data[2];
-        buffer.get(data, 2);
-        if (data[0] == 0x30){
-            cfg_state = false;
-        }
-        else if (data[0] == 0x31){
-            cfg_state = true;
-        }
-    }
-
-    hash_file_stream.close();
-    tmp->patcher_app_ver.push_back(patch_app_ver);
-    tmp->patcher_app_elf.push_back(patch_app_elf);
-    tmp->patcher_title.push_back(patch_title);
-    tmp->patcher_patch_ver.push_back(patch_ver);
-    tmp->patcher_name.push_back(patch_name);
-    tmp->patcher_author.push_back(patch_author);
-    tmp->patcher_note.push_back(patch_note);
-    tmp->patcher_enablement.push_back(cfg_state);
-    return;
+    g_patchManager.get_metadata1(tmp, patch_app_ver, patch_app_elf, patch_title, patch_ver, patch_name, patch_author, patch_note);
 }
 
-void trainer_launcher() {
-    return;
+void dl_patches() {
+    g_patchManager.dl_patches();
 }
 
-void dl_patches(){
-    std::string patch_zip = "patch1.zip";
-    std::string patch_url = "https://github.com/GoldHEN/GoldHEN_Patch_Repository/raw/gh-pages/" + patch_zip;
-    std::string patch_path = patch_path_base + "/" + patch_zip;
-    std::string patch_build_path = patch_path_base + "/patches/misc/patch_ver.txt";
-    std::string patch_dl_msg;
-    loadmsg(getLangSTR(LANG_STR::PATCH_DL_QUESTION_YES));
-    int ret = dl_from_url(patch_url.c_str(), patch_path.c_str());
-    if (ret != 0) // 0 != failed
-    {
-        log_error("dl_from_url for %s failed with %i", patch_url.c_str(), ret);
-        patch_dl_msg = fmt::format("Download failed with error code: {}", ret);
-        goto error;
-    }
-    if(!extract_zip(patch_path.c_str(), patch_path_base.c_str())){
-        patch_dl_msg = fmt::format("Failed to extract patch zip to {}", patch_path_base);
-    } else {
-        std::ifstream t(patch_build_path);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        patch_dl_msg = fmt::format("{}\n{}", getLangSTR(LANG_STR::PATCH_DL_COMPLETE), buffer.str());
-    }
-
-error:
-    sceMsgDialogTerminate();
-    msgok(MSG_DIALOG::NORMAL, patch_dl_msg);
-    return;
-}
+// We don't need it for now
+std::string get_patch_data(const std::string& path) { return ""; }
+bool get_metadata0(s32& pid, u64 ex_start) { return false; }
+void trainer_launcher() {}
