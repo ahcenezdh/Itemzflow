@@ -1,184 +1,170 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+
 #include <GLES2/gl2.h>
 #ifdef __ORBIS__
 #include <user_mem.h> 
 #endif
 #include "defines.h"
-#include <png.h>
-#include <string>
-#include <unordered_map>
-#include <future>
-#include <memory>
-#include <atomic>
-#include <mutex>
 
+/////// png
+#include <png.h>
+#include <string.h>
+#include <stdlib.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-class TextureManager {
-private:
-    std::unordered_map<std::string, GLuint> textureCache;
-    std::mutex cacheMutex;
+/// png format
+GLuint load_texture(
+    const GLsizei width, const GLsizei height,
+    const GLenum  type,  const GLvoid *pixels)
+{
+    // create new OpenGL texture
+    GLuint texture_object_id;
+    glGenTextures(1, &texture_object_id);
+    glBindTexture(GL_TEXTURE_2D, texture_object_id);
+    // set texture filtering
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    GLuint loadTextureInternal(const GLsizei width, const GLsizei height, const GLenum type, const GLvoid *pixels) {
-        GLuint textureId;
-        glGenTextures(1, &textureId);
-        glBindTexture(GL_TEXTURE_2D, textureId);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        return textureId;
-    }
+    // generate texture from bitmap data
 
-public:
-    GLuint loadTexture(const std::string& path) {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = textureCache.find(path);
-        if (it != textureCache.end()) {
-            return it->second;
-        }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    // don't create MipMaps, we must assert npot2!
+    // glGenerateMipmap(GL_TEXTURE_2D);
+    // release and return texture
+    glBindTexture(GL_TEXTURE_2D, 0);
 
-        int width, height, channels;
-        unsigned char* image = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
-        if (!image) {
-            log_error("Failed to load texture: %s", path.c_str());
-            return 0;
-        }
+//    log_info("width: %d, height: %d, type: %d, pixels: %p", width, height, type, pixels);
 
-        GLuint textureId = loadTextureInternal(width, height, GL_RGBA, image);
-        stbi_image_free(image);
-
-        textureCache[path] = textureId;
-        return textureId;
-    }
-
-    void clearCache() {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        for (const auto& pair : textureCache) {
-            glDeleteTextures(1, &pair.second);
-        }
-        textureCache.clear();
-    }
-
-    ~TextureManager() {
-        clearCache();
-    }
-};
-
-TextureManager g_textureManager;
-
-GLuint load_png_asset_into_texture(const char* relative_path) {
-    return g_textureManager.loadTexture(relative_path);
+    return texture_object_id;
 }
-
-struct PngWriteData {
-    int width;
-    int height;
-    std::unique_ptr<int[]> buffer;
-    std::string filename;
-    std::string title;
-};
-
-void writeImageAsync(PngWriteData&& data) {
-    FILE *fp = fopen(data.filename.c_str(), "wb");
-    if (!fp) {
-        log_error("Could not open file %s for writing", data.filename.c_str());
-        return;
-    }
-
-    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-    if (!png_ptr) {
-        log_error("Could not allocate write struct");
-        fclose(fp);
-        return;
-    }
-
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) {
-        log_error("Could not allocate info struct");
-        png_destroy_write_struct(&png_ptr, nullptr);
-        fclose(fp);
-        return;
-    }
-
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        log_error("Error during png creation");
-        png_destroy_write_struct(&png_ptr, &info_ptr);
-        fclose(fp);
-        return;
-    }
-
-    png_init_io(png_ptr, fp);
-    png_set_IHDR(png_ptr, info_ptr, data.width, data.height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
-
-    if (!data.title.empty()) {
-        png_text title_text;
-        title_text.compression = PNG_TEXT_COMPRESSION_NONE;
-        title_text.key = const_cast<char*>("Title");
-        title_text.text = const_cast<char*>(data.title.c_str());
-        png_set_text(png_ptr, info_ptr, &title_text, 1);
-    }
-
-    png_write_info(png_ptr, info_ptr);
-
-    std::vector<png_byte> row(3 * data.width);
-
-    for (int y = data.height - 1; y >= 0; --y) {
-        for (int x = 0; x < data.width; ++x) {
-            int* pixel = &data.buffer[y * data.width + x];
-            row[x * 3] = (*pixel >> 16) & 0xFF;
-            row[x * 3 + 1] = (*pixel >> 8) & 0xFF;
-            row[x * 3 + 2] = *pixel & 0xFF;
-        }
-        png_write_row(png_ptr, row.data());
-    }
-
-    png_write_end(png_ptr, nullptr);
-    png_destroy_write_struct(&png_ptr, &info_ptr);
-    fclose(fp);
-}
-
-void writeImage(const char* filename, int width, int height, int* buffer, const char* title) {
-    PngWriteData data{width, height, std::unique_ptr<int[]>(buffer), filename, title ? title : ""};
-    std::thread(writeImageAsync, std::move(data)).detach();
-}
-
-bool is_png_valid(const char* relative_path, int* width, int* height) {
-    int channels;
-    unsigned char* data = stbi_load(relative_path, width, height, &channels, 0);
-    if (data) {
-        stbi_image_free(data);
-        return true;
-    }
-    return false;
-}
-
-void load_png_cover_data_into_texture(struct AppIcon::ImageData& data, std::atomic<bool>& needs_loaded, std::atomic<GLuint>& tex) {
-    if (!data.data) {
-        log_error("Failed to load texture data");
-        return;
-    }
-
-    tex = g_textureManager.loadTextureInternal(data.w, data.h, GL_RGBA, data.data.get());
-    log_info("Loaded texture: %d", tex.load());
-
-    data.data.reset();
-    needs_loaded = false;
-}
-
-GLuint load_png_data_into_texture(const char* data, int size) {
-    int width, height, channels;
-    unsigned char* image = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(data), size, &width, &height, &channels, STBI_rgb_alpha);
-    if (!image) {
-        log_error("Failed to load texture from memory");
+/* externed */ 
+vec2 tex_size; // last loaded png size as (w, h)
+/// textures
+GLuint load_png_asset_into_texture(const char* relative_path)
+{  
+    int w = 0, h = 0, comp= 0;
+    unsigned char* image = stbi_load(relative_path, &w, &h, &comp, STBI_rgb_alpha);
+    if(image == nullptr){
+        log_debug( "%s(%s) FAILED!", __FUNCTION__, relative_path);
         return 0;
     }
 
-    GLuint tex = g_textureManager.loadTextureInternal(width, height, GL_RGBA, image);
+    GLuint tex = load_texture(w, h, comp, image);
+    log_info("loaded %s(%s) as %d", __FUNCTION__, relative_path, tex);
     stbi_image_free(image);
     return tex;
+}
+
+void load_png_cover_data_into_texture(struct AppIcon::ImageData& data, std::atomic<bool>& needs_loaded, std::atomic<GLuint>& tex)
+{
+    if (!data.data) {
+        log_debug("%s(%p) FAILED!", __FUNCTION__, data.data.get());
+        return;
+    }
+
+    tex = load_texture(data.w, data.h, data.comp, data.data.get());
+    log_info("loaded %s(%p) as %d", __FUNCTION__, data.data.get(), tex.load());
+
+    data.data.reset();  // Release the unique_ptr, freeing the memory
+    needs_loaded = false;
+}
+
+GLuint load_png_data_into_texture(const char* data, int size)
+{
+    int w = 0, h = 0, comp = 0;
+    unsigned char* image = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(data), size, &w, &h, &comp, STBI_rgb_alpha);
+    if (image == nullptr) {
+        log_debug("%s(data, %d) FAILED!", __FUNCTION__, size);
+        return 0;
+    }
+
+    GLuint tex = load_texture(w, h, comp, image);
+    log_info("loaded %s(data, %d) as %d", __FUNCTION__, size, tex);
+    stbi_image_free(image);
+    return tex;
+}
+// with int (u32)
+void setRGB(png_byte *ptr, int *val)
+{
+    unsigned char *c = (unsigned char *)val;
+
+    ptr[0] = *c++; ptr[1] = *c++; ptr[2] = *c++;
+}
+
+int writeImage(char* filename, int width, int height, int *buffer, const char* title)
+{
+    int code = 0;
+    FILE *fp = NULL;
+    png_structp png_ptr = NULL;
+    png_infop info_ptr = NULL;
+    png_bytep row = NULL;
+
+    // Open file for writing (binary mode)
+    fp = fopen(filename, "wb");
+    if (fp == NULL) { log_error( "Could not open file %s for writing", filename); code = 1; goto finalise; }
+
+    // Initialize write structure
+    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png_ptr == NULL) { log_error( "Could not allocate write struct"); code = 1; goto finalise; }
+    // Initialize info structure
+    info_ptr = png_create_info_struct(png_ptr);
+    if (info_ptr == NULL) { log_error( "Could not allocate info struct"); code = 1; goto finalise; }
+    // Setup Exception handling
+    if (setjmp(png_jmpbuf(png_ptr))) { log_error( "Error during png creation"); code = 1; goto finalise; }
+
+    png_init_io(png_ptr, fp);
+    // Write header (8 bit colour depth)
+    png_set_IHDR(png_ptr, info_ptr, width, height,
+            8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+            PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+    // Set title
+    if (title != NULL) {
+        png_text title_text;
+        title_text.compression = PNG_TEXT_COMPRESSION_NONE;
+        title_text.key = (char*)"Title";
+        title_text.text = (char*) title;
+        png_set_text(png_ptr, info_ptr, &title_text, 1);
+    }
+    png_write_info(png_ptr, info_ptr);
+
+    // Allocate memory for one row (3 bytes per pixel - RGB)
+    row = (png_bytep)calloc(3 * width +1, sizeof(png_byte));
+
+    // Write image data
+    int x, y;
+    // note we flip vertically here!
+    for (y=height ; y>-1 ; y--) {
+        for (x=0 ; x<width ; x++) {
+            setRGB(&(row[ x*3 ]), &buffer[y * width + x]); // converts RGBA to RGB
+        }
+        png_write_row(png_ptr, row);
+    }
+    // End write
+    png_write_end(png_ptr, NULL);
+
+finalise:
+
+    if (fp) fclose(fp);
+    if (info_ptr) png_free_data(png_ptr, info_ptr, PNG_FREE_ALL, -1);
+    if (png_ptr) png_destroy_write_struct(&png_ptr, (png_infopp)NULL);
+    if (row) free(row);
+
+    return code;
+}
+
+
+bool is_png_vaild(const char *relative_path, int *width, int *height) {
+    // Load the image with stb_image
+    int channels;
+    unsigned char *data = stbi_load(relative_path, width, height, &channels, 0);
+    // Check if the image was loaded successfully
+    if (data) {
+        stbi_image_free(data);
+        return true;
+    } else {
+        return false;
+    }
 }
